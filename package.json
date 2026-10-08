@@ -1,0 +1,13 @@
+{
+  "name": "kwihh-project",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Kwihh Project - 3D service marketplace (bots, tools, utilities, websites)",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "seed": "node server/index.js --seed",
+    "test": "node test/run.js"
+  },
+  "engines": { "node": ">=18" }
+}

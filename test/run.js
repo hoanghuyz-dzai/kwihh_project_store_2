@@ -1,0 +1,91 @@
+// End-to-end tests against a real server instance with a temporary data directory.
+const os = require('os'), fs = require('fs'), path = require('path'), assert = require('assert');
+process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'kwihh-'));
+process.env.ADMIN_PASSWORD = 'adminpass123'; process.env.PORT = '0'; process.env.NODE_ENV = 'test';
+const { server, store } = require('../server/index');
+let n = 0; const ok = (c, m) => { assert(c, 'FAILED: ' + m); console.log('  ✓', m); n++; };
+const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47]), Buffer.alloc(64)]).toString('base64');
+const ZIP = Buffer.concat([Buffer.from('PK'), Buffer.alloc(64)]).toString('base64');
+
+(async () => {
+  await new Promise(r => server.listen(0, r));
+  const base = 'http://127.0.0.1:' + server.address().port;
+  const client = () => { let c = ''; return async (p, m = 'GET', b) => {
+    const r = await fetch(base + p, { method: m, headers: { ...(b ? { 'Content-Type': 'application/json' } : {}), cookie: c }, body: b && JSON.stringify(b) });
+    const sc = r.headers.get('set-cookie'); if (sc) c = sc.split(';')[0];
+    const t = await r.text(); let j; try { j = JSON.parse(t); } catch { j = t; } return { s: r.status, j, h: r.headers };
+  }; };
+  const A = client(), U = client(), G = client();
+  const bal = async c => (await c('/api/auth/me')).j.user.balance;
+
+  console.log('AUTH');
+  const reg = { email: 't@x.com', username: 'tester', password: 'password1', confirm: 'password1', birth_date: '2000-01-01' };
+  ok((await G('/api/auth/register', 'POST', reg)).s === 200, 'register');
+  ok((await G('/api/auth/register', 'POST', reg)).j.error === 'Tên tài khoản này đã được sử dụng.', 'duplicate username');
+  ok((await G('/api/auth/register', 'POST', { ...reg, username: 'tester2' })).s === 409, 'duplicate email');
+  ok((await G('/api/auth/register', 'POST', { ...reg, username: 'a b', email: 'q@x.com' })).s === 400, 'invalid username rejected');
+  const w1 = await G('/api/auth/login', 'POST', { username: 'tester', password: 'nope' }), w2 = await G('/api/auth/login', 'POST', { username: 'ghost', password: 'nope' });
+  ok(w1.s === 401 && w1.j.error === w2.j.error, 'wrong login: same error for unknown user and wrong password');
+  const li = await U('/api/auth/login', 'POST', { username: 'tester', password: 'password1' });
+  ok(li.s === 200 && li.h.get('set-cookie').includes('HttpOnly') && !JSON.stringify(li.j).includes('hash'), 'login sets HttpOnly cookie, no hash leaked');
+  ok((await G('/api/services')).s === 401, 'protected route requires login');
+  ok((await U('/api/admin/stats')).s === 403, 'user blocked from admin API');
+
+  console.log('SERVICES + FILE RESOLVER');
+  const bots = (await U('/api/services?category=bot')).j.services;
+  const tg20 = bots.find(s => s.type === 'telegram' && s.price === 20000), tg30 = bots.find(s => s.type === 'telegram' && s.price === 30000);
+  ok(tg20 && tg20.hasFile === true && tg30 && tg30.hasFile === false, 'file found for telegram 20k, missing for 30k');
+  ok(fs.existsSync(path.join(process.env.DATA_DIR, 'file', 'bottelegram20k.zip')), 'resolver maps to data/file/bottelegram20k.zip');
+  ok((await U('/api/orders', 'POST', { service_id: tg20.id })).j.error === '⚠️ Số dư không đủ.', 'insufficient balance rejected');
+  ok((await U('/api/orders', 'POST', { service_id: 99999 })).j.error === '⚠️ Dịch vụ không tồn tại.', 'unknown service');
+  ok((await A('/api/auth/login', 'POST', { username: 'admin', password: 'adminpass123' })).s === 200, 'admin login');
+  const tester = (await A('/api/admin/users?q=test')).j.users[0];
+  ok((await A(`/api/admin/users/${tester.id}/balance`, 'PATCH', { amount: 20000, reason: 'test' })).j.balance === 20000, 'admin +20000');
+  ok((await U('/api/orders', 'POST', { service_id: tg30.id })).j.error === '⚠️ File sản phẩm hiện chưa được cập nhật.' && await bal(U) === 20000, 'missing file: error and NOT charged');
+  ok((await U('/api/orders', 'POST', { service_id: tg20.id, price: 1 })).s === 200 && await bal(U) === 0, 'purchase charges DB price (client price ignored)');
+  const ord = (await U('/api/orders')).j.orders[0];
+  const dl = await U(`/api/orders/${ord.id}/download`);
+  ok(dl.s === 200 && dl.h.get('content-type') === 'application/zip', 'download after purchase');
+  ok((await U(`/api/orders/${ord.id}`)).j.order.status === 'completed', 'order completed after download');
+  ok((await G(`/api/orders/${ord.id}/download`)).s === 401 && (await A(`/api/orders/${ord.id}/download`)).s === 404, 'download blocked for guests and other users');
+  await A(`/api/admin/users/${tester.id}/balance`, 'PATCH', { amount: 40000 });
+  const race = await Promise.all([1, 2, 3].map(() => U('/api/orders', 'POST', { service_id: tg20.id })));
+  ok(race.filter(r => r.s === 200).length === 2 && await bal(U) === 0, 'concurrent purchases never overspend');
+  ok((await A(`/api/admin/users/${tester.id}/balance`, 'PATCH', { amount: -5 })).s === 400, 'balance cannot go negative');
+  const raw = await fetch(base + '/data/file/bottelegram20k.zip'); ok((await raw.text()).includes('<html') , 'data/file not served directly (SPA fallback only)');
+
+  console.log('BANK');
+  ok((await U('/api/bank/info')).j.transfer_content === 'NAP BANK @tester', 'transfer content = NAP BANK @username');
+  ok((await U('/api/bank/deposit', 'POST', { amount: 1234 })).s === 400, 'unsupported amount rejected');
+  ok((await U('/api/bank/deposit', 'POST', { amount: 20000 })).s === 200 && await bal(U) === 0, 'deposit request created, no auto credit');
+  const dep = (await A('/api/admin/bank/deposits')).j.deposits[0];
+  ok(dep.status === 'pending' && dep.transfer_content === 'NAP BANK @tester', 'admin sees pending deposit');
+  ok((await U(`/api/admin/bank/deposits/${dep.id}/approve`, 'POST', {})).s === 403, 'user cannot approve');
+  ok((await A(`/api/admin/bank/deposits/${dep.id}/approve`, 'POST', {})).s === 200 && await bal(U) === 20000, 'approve credits balance');
+  ok((await A(`/api/admin/bank/deposits/${dep.id}/approve`, 'POST', {})).s === 409 && await bal(U) === 20000, 'double approval blocked');
+  await U('/api/bank/deposit', 'POST', { amount: 10000 });
+  const dep2 = (await A('/api/admin/bank/deposits')).j.deposits[0];
+  ok((await A(`/api/admin/bank/deposits/${dep2.id}/reject`, 'POST', {})).s === 200 && await bal(U) === 20000, 'reject leaves balance');
+  ok((await A('/api/admin/bank/qr', 'POST', { data: Buffer.from('not an image').toString('base64') })).s === 400, 'QR upload rejects non-images');
+  ok((await A('/api/admin/bank/qr', 'POST', { data: PNG })).s === 200 && (await U('/api/bank/qr')).h.get('content-type') === 'image/png', 'QR upload + served via API');
+  ok((await A('/api/admin/bank', 'PATCH', { bank_name: 'ACB', account_number: '123456', account_name: 'KWIHH', amounts: [10000, 50000] })).s === 200 && (await U('/api/bank/info')).j.account_number === '123456', 'admin edits bank info');
+
+  console.log('ADMIN');
+  const body = { category: 'bot', type: 'telegram', name: 'Bot Telegram', description: 'x', price: 70000 };
+  ok((await A('/api/admin/services', 'POST', body)).s === 200 && (await A('/api/admin/services', 'POST', body)).s === 409, 'create service, duplicate blocked');
+  ok((await A('/api/admin/files', 'POST', { name: 'bottelegram70k.zip', data: ZIP })).s === 200, 'upload product file');
+  ok((await A('/api/admin/files', 'POST', { name: '../evil.zip', data: ZIP })).s === 400, 'upload path traversal rejected');
+  const s70 = (await U('/api/services?category=bot')).j.services.find(s => s.price === 70000);
+  ok(s70 && s70.hasFile, 'new service resolves uploaded file');
+  ok((await A(`/api/admin/services/${s70.id}`, 'PATCH', { ...body, price: 80000 })).s === 200, 'admin changes price');
+  ok((await A(`/api/admin/services/${s70.id}`, 'DELETE')).s === 200 && !(await U('/api/services?category=bot')).j.services.find(s => s.id === s70.id), 'delete hides service');
+  ok((await A(`/api/admin/users/${tester.id}`, 'PATCH', { status: 'locked' })).s === 200 && (await U('/api/auth/me')).s === 401, 'lock user kills session');
+  ok((await A(`/api/admin/users/${tester.id}`, 'PATCH', { status: 'active' })).s === 200, 'unlock user');
+  const logs = (await A('/api/admin/logs')).j.logs.map(l => l.action);
+  ok(['BALANCE_CHANGE', 'BANK_APPROVE', 'BANK_REJECT', 'SERVICE_CREATE', 'FILE_UPLOAD', 'USER_UPDATE'].every(a => logs.includes(a)), 'admin actions are logged');
+  const types = store.data.transactions.map(t => t.type);
+  ok(['PURCHASE', 'DEPOSIT', 'ADMIN_ADD'].every(t => types.includes(t)), 'transaction log has PURCHASE / DEPOSIT / ADMIN_ADD');
+  ok((await U('/api/auth/login', 'POST', { username: 'tester', password: 'password1' })).s === 200 && (await U('/api/account/password'.replace('password', 'password'), 'PATCH', { old_password: 'password1', new_password: 'newpass123' })).s === 200, 'change password');
+  ok((await U('/api/auth/logout', 'POST', {})).s === 200 && (await U('/api/auth/me')).s === 401, 'logout kills session');
+  console.log(`\nALL ${n} CHECKS PASSED`); server.close(); process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
